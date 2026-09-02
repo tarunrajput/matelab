@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>MateLab engine host</title>
+</head>
+<body>
+<script>
+  // Bridge contract (see src/engine/protocol.ts):
+  //   RN -> page : EngineRequest JSON (uci/isready/setoption/position/go/stop/ucinewgame/quit)
+  //   page -> RN : EngineEvent JSON (uci-ok/readyok/bestmove/info/error)
+  //
+  // The nmrugg single-file glue runs the engine inside its own Web Worker and
+  // speaks raw UCI lines over postMessage. The glue ships as engine-glue.txt
+  // (Metro must not parse it as a module), so its served MIME type is
+  // text/plain — Worker() rejects that. We fetch the source and spawn the
+  // Worker from a JS-typed blob instead. The wasm URL travels in the location
+  // hash: the glue's worker branch reads it as e[0] of location.hash. NO
+  // ",worker" suffix — that selects its emscripten pthread bootstrap, which
+  // stays silent without a load handshake.
+  var worker = null;
+
+  function send(event) {
+    if (window.ReactNativeWebView) {
+      ReactNativeWebView.postMessage(JSON.stringify(event));
+    }
+  }
+
+  var infoBuf = [];
+  var infoFlushTimer = null;
+
+  function flushInfoBuf() {
+    if (infoFlushTimer) { clearTimeout(infoFlushTimer); infoFlushTimer = null; }
+    if (infoBuf.length) {
+      send({ type: 'info', payload: infoBuf.join('\n') });
+      infoBuf.length = 0;
+    }
+  }
+
+  function uciOut(data) {
+    // The worker may batch several UCI lines into one message.
+    var lines = String(data).split('\n');
+    for (var i = 0; i < lines.length; i++) {
+      var s = lines[i].replace(/\r$/, '');
+      if (s === 'uciok') { flushInfoBuf(); send({ type: 'uci-ok', payload: s }); }
+      else if (s === 'readyok') { flushInfoBuf(); send({ type: 'readyok', payload: s }); }
+      else if (s.indexOf('bestmove') === 0) { flushInfoBuf(); send({ type: 'bestmove', payload: s }); }
+      else if (s.indexOf('info depth') === 0 || s.indexOf('info string') === 0) {
+        // Score lines are the only ones RN consumes (see EngineService);
+        // everything else is eval-bar noise. Buffer per 33ms tick so one
+        // search crosses the bridge in a few messages instead of dozens.
+        infoBuf.push(s);
+        if (!infoFlushTimer) {
+          infoFlushTimer = setTimeout(flushInfoBuf, 33);
+        }
+      }
+    }
+  }
+
+  function toUci(req) {
+    switch (req.type) {
+      case 'uci': return 'uci';
+      case 'isready': return 'isready';
+      case 'ucinewgame': return 'ucinewgame';
+      case 'setoption': return 'setoption name ' + req.name + ' value ' + req.value;
+      case 'position': {
+        var p = 'position fen ' + req.fen;
+        if (req.moves && req.moves.length) p += ' moves ' + req.moves.join(' ');
+        return p;
+      }
+      case 'go': {
+        var g = 'go';
+        if (req.depth) g += ' depth ' + req.depth;
+        if (req.movetime) g += ' movetime ' + req.movetime;
+        return g;
+      }
+      case 'stop': return 'stop';
+      case 'quit': return 'quit';
+      default: return null;
+    }
+  }
+
+  // Android fires RN posts on document 'message'; iOS on window. Both listeners
+  // exist for portability, but each platform must dispatch exactly once.
+  var lastData = null;
+  var lastTs = 0;
+  function dispatch(msg) {
+    var now = Date.now();
+    if (msg.data === lastData && now - lastTs < 10) return; // duplicate channel delivery
+    lastData = msg.data;
+    lastTs = now;
+    var req;
+    try { req = JSON.parse(msg.data); } catch (e) { return; }
+    var cmd = toUci(req);
+    if (cmd === null) { send({ type: 'error', payload: 'unknown request type: ' + req.type }); return; }
+    worker.postMessage(cmd);
+  }
+
+  document.addEventListener('message', dispatch);   // Android WebView legacy channel
+  window.addEventListener('message', dispatch);     // iOS WKWebView channel
+  // Metro dev server exposes bundled assets through a query-based route:
+  //   /assets/?unstable_path=./assets/engine/engine.html?platform=android&hash=...
+  // document.baseURI is just /assets/, so relative resolution loses the real
+  // path. Rebuild sibling URLs from the decoded unstable_path instead.
+  // (Release builds resolve assets differently — see idea open questions.)
+  var upMatch = /unstable_path=([^&?]*)/.exec(location.search);
+  var assetDir = upMatch
+    ? decodeURIComponent(upMatch[1]).slice(0, decodeURIComponent(upMatch[1]).lastIndexOf('/') + 1)
+    : './';
+  var glueUrl = location.origin + '/assets/' + assetDir + 'engine-glue.txt';
+  var wasmUrl = location.origin + '/assets/' + assetDir + 'stockfish-18-lite-single.wasm';
+  fetch(glueUrl)
+    .then(function (r) {
+      if (!r.ok) throw new Error('glue fetch failed: ' + r.status);
+      return r.text();
+    })
+    .then(function (src) {
+      var blobUrl = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+      worker = new Worker(blobUrl + '#' + encodeURIComponent(wasmUrl));
+      worker.onmessage = function (e) { uciOut(e.data); };
+      worker.onerror = function (e) { send({ type: 'error', payload: 'worker error: ' + (e.message || 'unknown') }); };
+      send({ type: 'info', payload: 'engine-booted' });
+    })
+    .catch(function (e) {
+      send({ type: 'error', payload: 'boot failed: ' + e.message + ' | page=' + location.href + ' | glue=' + glueUrl });
+    });
+</script>
+</body>
+</html>
